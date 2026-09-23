@@ -633,3 +633,146 @@ def test_scanlines_422_on_unparseable_stored_path(client):
     assert r.status_code == 422
     assert "无法解析" in r.json()["detail"]
 
+
+# ---------------------------------------------------------------------------
+# POST /paths/{id}/cut-plan 闭合轮廓加工计划（只读）
+# ---------------------------------------------------------------------------
+
+def test_cut_plan_hole_before_outer_with_air_distances(client):
+    # 外方 0..20 含内孔 5..15；起点 (0,0)
+    pid = _mk(client, "M0,0h20v20h-20Z M5,5h10v10h-10Z")
+    r = client.post(f"/paths/{pid}/cut-plan", json={"x": 0, "y": 0})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == pid
+    assert body["fill_rule"] == "nonzero"
+    assert body["start"] == {"x": 0.0, "y": 0.0}
+    assert body["total_contours"] == 2
+    assert body["skipped_contours"] == []
+
+    s1, s2 = body["steps"]
+    # 后代先加工：孔（索引 1）先于外环（索引 0）
+    assert s1["order"] == 1 and s2["order"] == 2
+    assert s1["original_index"] == 1 and s1["role"] == "hole"
+    assert s1["depth"] == 1
+    assert s1["entry_point"] == {"x": 5.0, "y": 5.0}
+    assert s1["entry_vertex"] == 0
+    assert abs(s1["air_distance"] - (5 * 2 ** 0.5)) < 1e-9
+    assert s1["head_after"] == s1["entry_point"]
+    # 第二步刀头停在 (5,5)，外环最近顶点 (0,0)
+    assert s2["original_index"] == 0 and s2["role"] == "outer"
+    assert s2["entry_point"] == {"x": 0.0, "y": 0.0}
+    assert abs(s2["air_distance"] - (5 * 2 ** 0.5)) < 1e-9
+    assert abs(body["total_air_distance"]
+               - s1["air_distance"] - s2["air_distance"]) < 1e-9
+
+
+def test_cut_plan_three_level_nesting_inside_out(client):
+    pid = _mk(client,
+              "M0,0h100v100h-100Z M10,10h80v80h-80Z M40,40h20v20h-20Z")
+    body = client.post(f"/paths/{pid}/cut-plan",
+                       json={"x": 0, "y": 0}).json()
+    assert [s["original_index"] for s in body["steps"]] == [2, 1, 0]
+    # 链式空走：岛 (40,40) -> 孔 (10,10) -> 外环 (0,0)
+    assert abs(body["steps"][0]["air_distance"]
+               - (40 * 2 ** 0.5)) < 1e-9
+    assert abs(body["steps"][1]["air_distance"]
+               - (30 * 2 ** 0.5)) < 1e-9
+    assert abs(body["steps"][2]["air_distance"]
+               - (10 * 2 ** 0.5)) < 1e-9
+
+
+def test_cut_plan_tie_breaks_by_original_index_then_vertex(client):
+    # 两个独立外环，起点 (15,0)：到两轮廓最近顶点等距，原始索引小者先
+    pid = _mk(client, "M0,0h10v10h-10Z M20,0h10v10h-10Z")
+    body = client.post(f"/paths/{pid}/cut-plan",
+                       json={"x": 15, "y": 0}).json()
+    s1, s2 = body["steps"]
+    assert s1["original_index"] == 0
+    assert s1["entry_point"] == {"x": 10.0, "y": 0.0}
+    assert s2["original_index"] == 1
+    assert s2["entry_point"] == {"x": 20.0, "y": 0.0}
+    assert body["total_air_distance"] == 15.0
+
+    # 起点在正方形中心：四顶点等距，顶点序号 0 决胜
+    pid2 = _mk(client, "M0,0h10v10h-10Z")
+    body = client.post(f"/paths/{pid2}/cut-plan",
+                       json={"x": 5, "y": 5}).json()
+    assert body["steps"][0]["entry_vertex"] == 0
+    assert body["steps"][0]["entry_point"] == {"x": 0.0, "y": 0.0}
+
+
+def test_cut_plan_skips_open_and_degenerate(client):
+    pid = _mk(client,
+              "M0,0h10v10h-10Z M5,5 L8,5 L5,5 Z M20,0 L30,0 L30,10")
+    body = client.post(f"/paths/{pid}/cut-plan",
+                       json={"x": 0, "y": 0}).json()
+    assert body["total_contours"] == 1
+    assert [s["original_index"] for s in body["steps"]] == [0]
+    reasons = {(s["original_index"], s["reason"])
+               for s in body["skipped_contours"]}
+    assert reasons == {(1, "degenerate"), (2, "open")}
+
+
+def test_cut_plan_no_valid_contours_empty_plan(client):
+    pid = _mk(client, "M0,0 L10,0 L10,10")
+    body = client.post(f"/paths/{pid}/cut-plan",
+                       json={"x": 3, "y": 4}).json()
+    assert body["total_contours"] == 0
+    assert body["steps"] == []
+    assert body["total_air_distance"] == 0.0
+    assert body["start"] == {"x": 3.0, "y": 4.0}
+    assert body["skipped_contours"][0]["reason"] == "open"
+
+
+def test_cut_plan_is_readonly_and_needs_no_prior_normalization(client):
+    pid = _mk(client, "M0,0h20v20h-20Z M5,5h10v10h-10Z")
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    assert client.post(f"/paths/{pid}/cut-plan",
+                       json={"x": 0, "y": 0}).status_code == 200
+    # 即时规划不写库
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    b1 = client.post(f"/paths/{pid}/cut-plan",
+                     json={"x": 0, "y": 0}).json()
+    b2 = client.post(f"/paths/{pid}/cut-plan",
+                     json={"x": 0, "y": 0}).json()
+    assert b1 == b2
+
+
+def test_cut_plan_404(client):
+    assert client.post("/paths/999999/cut-plan",
+                       json={"x": 0, "y": 0}).status_code == 404
+
+
+def test_cut_plan_422_on_invalid_start(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    url = f"/paths/{pid}/cut-plan"
+    assert client.post(url, json={"y": 0}).status_code == 422       # 缺 x
+    assert client.post(url, json={"x": 1}).status_code == 422       # 缺 y
+    assert client.post(url, json={}).status_code == 422
+    assert client.post(url, json={"x": "a", "y": 0}).status_code == 422
+    assert client.post(url, json={"x": 0, "y": "nan"}).status_code == 422
+    # NaN / Infinity / 超大数（非有限）均须 422 而不是 500
+    assert client.post(url, json={"x": "nan", "y": 0}).status_code == 422
+    r = client.post(url,
+                    content='{"x": 1e999, "y": 0}',
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
+    r = client.post(url,
+                    content='{"x": 0, "y": -1e999}',
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
+
+
+def test_cut_plan_422_on_unparseable_stored_path(client):
+    from app import db
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO paths (d, fill_rule, metadata, contour_metadata) "
+            "VALUES (?, 'nonzero', '{}', '[]')",
+            ("M0,0 L",))
+        bad_id = cur.lastrowid
+    r = client.post(f"/paths/{bad_id}/cut-plan", json={"x": 0, "y": 0})
+    assert r.status_code == 422
+    assert "无法解析" in r.json()["detail"]
+

@@ -8,7 +8,10 @@
 **`POST /paths/{id}/scanlines` 水平扫描线填充区间**
 （在整体包围盒内等间距取水平扫描线，按层级交替合并外环/孔/岛，输出逐行填充区间）、
 **`POST /paths/{id}/clearance` 轮廓间安全间隙校验**
-（按细分线段计算任意两轮廓边界的最小欧氏距离）与 **`POST /paths/compare` 版本差异审计**，
+（按细分线段计算任意两轮廓边界的最小欧氏距离）、
+**`POST /paths/{id}/cut-plan` 闭合轮廓加工计划**
+（后代先加工、每轮贪心选取距刀头最近的细分顶点入刀，输出加工顺序与逐段空走距离）
+与 **`POST /paths/compare` 版本差异审计**，
 按几何指纹稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，
 可直接调用。
 
@@ -24,8 +27,9 @@
 │   ├── metrics.py     # 填充面积与面积质心：外/孔/岛交替计入，基于细分多边形
 │   ├── scanlines.py   # 水平扫描线填充区间：半开边求交、按层级交替合并，逐行输出
 │   ├── clearance.py   # 轮廓间安全间隙校验：逐段最小欧氏距离、孔-直接 parent 标记
+│   ├── cutplan.py     # 闭合轮廓加工计划：后代先加工 + 最近入刀点贪心、逐段空走距离
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（132 个）
+├── tests/             # pytest 单元 + API 端到端测试（157 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -34,6 +38,8 @@
 
 ## 快速开始（Docker Compose，推荐）
 
+单条命令即可启动（构建镜像、建表、健康检查全自动，无需其他配置）：
+
 ```bash
 docker compose up --build
 ```
@@ -41,6 +47,13 @@ docker compose up --build
 服务在 <http://localhost:8000>，交互式文档在 <http://localhost:8000/docs>。
 容器启动时通过 FastAPI lifespan 自动在 `/data/svgapi.db` 建表（数据存放在命名卷
 `svgapi-data` 中），健康探针 `GET /healthz` 通过后即可调用。
+
+必要配置（均有默认值，通常无需修改）：
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `SVGAPI_DB_PATH` | `/data/svgapi.db`（容器内） | SQLite 数据库文件路径 |
+| 端口映射 | `8000:8000` | 宿主机 8000 -> 容器 8000，API 地址 <http://localhost:8000> |
 
 不用 Compose 时：
 
@@ -321,6 +334,76 @@ curl -s -X POST localhost:8000/paths/1/clearance \
 # -> conflict_count=1，b.role="open"，distance=1.0，hole_parent=false
 ```
 
+### `POST /paths/{id}/cut-plan` — 闭合轮廓加工计划（只读）
+
+对已存路径**即时解析**并完成轮廓包含层级分类（无需事先调用 normalize，
+**不写数据库**），从给定刀头起点 `(x, y)` 出发，为全部**闭合且非退化**
+轮廓（`outer` / `hole`）生成加工顺序与每步空走（rapid traverse）距离：
+
+- **后代先加工**：一个轮廓必须等它的**全部后代**（任意深度的孔/岛，
+  按 `parent_original_index` 传递）加工完后才可加工——先加工最深层
+  轮廓，逐层向外；
+- **最近入刀点贪心**：每轮在当前可加工（未加工且所有后代均已加工）的
+  轮廓中，从各自**细分后的全部顶点**里找出距刀头当前位置最近的一个
+  作为该轮廓的入刀点，再在这些候选里取最近者；距离相同（平方距离
+  精确相等）时依次按**原始索引**、**顶点序号**决胜；
+- **刀头停在入刀点**：闭合轮廓走刀一圈后回到入刀点，随后以该点为
+  起点继续选择下一步，直至所有有效轮廓加工完毕；
+- **开放轮廓**（未以 `Z` 闭合）与**退化轮廓**（面积为 0 或顶点不足）
+  跳过并列入 `skipped_contours`；没有任何有效闭合轮廓（空路径、
+  仅开放/退化轮廓）时返回空计划（`steps` 为空、总空走距离为 0）。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `x` | number | 刀头起点 x 坐标，必须为有限数值（NaN/无穷/非数字返回 `422`） |
+| `y` | number | 刀头起点 y 坐标，必须为有限数值（NaN/无穷/非数字返回 `422`） |
+
+```bash
+# 外方 0..100 含孔 10..90、孔中岛 40..60，刀头起点 (0,0)
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h100v100h-100Z M10,10h80v80h-80Z M40,40h20v20h-20Z"
+}'
+curl -s -X POST localhost:8000/paths/1/cut-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"x": 0, "y": 0}'
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "fill_rule": "nonzero",
+  "start": {"x": 0.0, "y": 0.0},
+  "total_contours": 3,
+  "steps": [
+    {"order": 1, "original_index": 2, "role": "outer", "depth": 2,
+     "entry_vertex": 0, "entry_point": {"x": 40.0, "y": 40.0},
+     "air_distance": 56.568542495, "head_after": {"x": 40.0, "y": 40.0}},
+    {"order": 2, "original_index": 1, "role": "hole", "depth": 1,
+     "entry_vertex": 0, "entry_point": {"x": 10.0, "y": 10.0},
+     "air_distance": 42.426406871, "head_after": {"x": 10.0, "y": 10.0}},
+    {"order": 3, "original_index": 0, "role": "outer", "depth": 0,
+     "entry_vertex": 0, "entry_point": {"x": 0.0, "y": 0.0},
+     "air_distance": 14.142135624, "head_after": {"x": 0.0, "y": 0.0}}
+  ],
+  "total_air_distance": 113.13708499,
+  "skipped_contours": []
+}
+```
+
+- `steps[]`：按加工顺序排列，每步含 `order`（从 1 开始）、轮廓
+  `original_index` / `role` / `depth`、入刀点 `entry_point` 及其在
+  细分顶点列表中的序号 `entry_vertex`、本步空走距离 `air_distance`
+  （刀头当前位置到入刀点的欧氏距离）与加工后刀头位置 `head_after`
+  （闭合轮廓恒等于入刀点）；
+- `total_air_distance`：各步空走距离之和；
+- `skipped_contours[]`：跳过的轮廓及 `reason`（`open` / `degenerate`）；
+- 路径不存在返回 `404`，`x` / `y` 缺失或非有限数返回 `422`，
+  已存路径无法解析返回 `422`。
+
 ### `GET /paths/{id}` — 查询原始路径、规范化结果与警告
 
 未规范化时 `normalized` 为 `null`；已规范化时包含 `d`、`contours`、
@@ -466,7 +549,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 132 passed
+pytest -q          # 157 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -484,7 +567,11 @@ added/removed、元数据透传、未规范化即时审计与脏数据 422；
 安全间隙的点/线段距离原语（相交、零长度段）、孔-直接 parent 标记、
 同级孔与隔层 island 不标记、**距离等于阈值通过**、开放轮廓默认跳过与
 `include_open` 纳入、退化轮廓始终跳过、曲线细分、包围盒剔除、结果确定性与
-只读不落库、404/非法参数 422 等。
+只读不落库、404/非法参数 422 等；
+闭合轮廓加工计划的后代先加工（外-孔、外-孔-岛三层、同级孔全部先于父轮廓）、
+每轮最近细分顶点入刀与刀头停在入刀点的链式空走距离、距离相等时按原始索引、
+顶点序号决胜、曲线细分顶点入刀、开放与退化跳过、无有效轮廓空计划、
+两种填充规则一致、确定性与只读不落库、404/非有限起点 422 等。
 
 ## 数据存储
 
